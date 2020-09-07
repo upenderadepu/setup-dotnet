@@ -16,6 +16,8 @@ documentation
 [software installed on github hosted runners](https://help.github.com/en/actions/reference/software-installed-on-github-hosted-runners)
 for .NET SDK versions that are currently available.
 
+TEST
+
 # Usage
 
 See [action.yml](action.yml)
