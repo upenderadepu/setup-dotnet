@@ -1,47 +1,745 @@
-import io = require('@actions/io');
-import fs = require('fs');
-import os = require('os');
-import path = require('path');
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+  test
+} from '@jest/globals';
+import semver from 'semver';
+import os from 'os';
 
-const toolDir = path.join(__dirname, 'runner', 'tools2');
-const tempDir = path.join(__dirname, 'runner', 'temp2');
+jest.unstable_mockModule('@actions/core', () => ({
+  getInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  setFailed: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  info: jest.fn(),
+  setOutput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn()
+}));
+jest.unstable_mockModule('fs', () => {
+  const actual = jest.requireActual('fs') as typeof import('fs');
+  const existsSync = jest.fn(actual.existsSync);
+  const readFileSync = jest.fn(actual.readFileSync);
+  return {
+    ...actual,
+    existsSync,
+    readFileSync,
+    default: {...actual, existsSync, readFileSync}
+  };
+});
+jest.unstable_mockModule('../src/authutil', () => ({
+  configAuthentication: jest.fn()
+}));
+jest.unstable_mockModule('../src/cache-utils', () => ({
+  isCacheFeatureAvailable: jest.fn(),
+  getNuGetFolderPath: jest.fn()
+}));
+jest.unstable_mockModule('../src/cache-restore', () => ({
+  restoreCache: jest.fn()
+}));
 
-import * as setup from '../src/setup-dotnet';
-
-const IS_WINDOWS = process.platform === 'win32';
+const core = await import('@actions/core');
+const fs = await import('fs');
+const auth = await import('../src/authutil.js');
+const cacheUtils = await import('../src/cache-utils.js');
+const cacheRestore = await import('../src/cache-restore.js');
+const setup = await import('../src/setup-dotnet.js');
+const {DotnetCoreInstaller, DotnetInstallDir} =
+  await import('../src/installer.js');
 
 describe('setup-dotnet tests', () => {
-  beforeAll(async () => {
-    process.env.RUNNER_TOOL_CACHE = toolDir;
-    process.env.DOTNET_INSTALL_DIR = toolDir;
-    process.env.RUNNER_TEMP = tempDir;
-    await io.rmRF(toolDir);
-    await io.rmRF(tempDir);
+  const inputs = {} as any;
+
+  const getInputSpy = core.getInput as jest.Mock;
+  const getMultilineInputSpy = core.getMultilineInput as jest.Mock;
+  const getBooleanInputSpy = core.getBooleanInput as jest.Mock;
+  const setFailedSpy = core.setFailed as jest.Mock;
+  const warningSpy = core.warning as jest.Mock;
+  const debugSpy = core.debug as jest.Mock;
+  const infoSpy = core.info as jest.Mock;
+  const setOutputSpy = core.setOutput as jest.Mock;
+
+  const existsSyncSpy = fs.existsSync as jest.Mock;
+  const readFileSyncSpy = fs.readFileSync as jest.Mock;
+
+  const maxSatisfyingSpy = jest.spyOn(semver, 'maxSatisfying');
+
+  const installDotnetSpy = jest.spyOn(
+    DotnetCoreInstaller.prototype,
+    'installDotnet'
+  );
+
+  const isCacheFeatureAvailableSpy =
+    cacheUtils.isCacheFeatureAvailable as jest.Mock;
+  const restoreCacheSpy = cacheRestore.restoreCache as jest.Mock;
+  const configAuthenticationSpy = auth.configAuthentication as jest.Mock;
+  const addToPathOriginal = DotnetInstallDir.addToPath;
+
+  describe('run() tests', () => {
+    beforeEach(() => {
+      DotnetInstallDir.addToPath = jest.fn();
+      getMultilineInputSpy.mockImplementation(input => inputs[input as string]);
+      getInputSpy.mockImplementation(input => inputs[input as string]);
+      getBooleanInputSpy.mockImplementation(input => {
+        const value = inputs[input as string];
+        return typeof value === 'string'
+          ? value.toLowerCase() === 'true'
+          : !!value;
+      });
+    });
+
+    afterEach(() => {
+      DotnetInstallDir.addToPath = addToPathOriginal;
+      delete process.env['DOTNET_CHECK_LATEST'];
+      jest.clearAllMocks();
+      jest.resetAllMocks();
+    });
+
+    it('should fail the action if global-json-file input is present, but the file does not exist in the file system', async () => {
+      inputs['global-json-file'] = 'fictitious.json';
+      inputs['dotnet-version'] = [];
+
+      const expectedErrorMessage = `The specified global.json file '${inputs['global-json-file']}' does not exist`;
+
+      await setup.run();
+      expect(setFailedSpy).toHaveBeenCalledWith(expectedErrorMessage);
+    });
+
+    test(`if 'dotnet-version' and 'global-json-file' inputs aren't present, should log into debug output, try to find global.json in the repo root, fail and log message into info output`, async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = [];
+
+      maxSatisfyingSpy.mockImplementation(() => null);
+      setOutputSpy.mockImplementation(() => {});
+
+      const expectedDebugMessage =
+        'No version found, trying to find version from global.json';
+      const expectedInfoMessage = `The global.json wasn't found in the root directory. No .NET version will be installed.`;
+
+      await setup.run();
+
+      expect(debugSpy).toHaveBeenCalledWith(expectedDebugMessage);
+      expect(existsSyncSpy).toHaveBeenCalled();
+      expect(infoSpy).toHaveBeenCalledWith(expectedInfoMessage);
+    });
+
+    it('should fail the action if quality is supplied but its value is not supported', async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = ['10.0'];
+      inputs['dotnet-quality'] = 'fictitiousQuality';
+
+      const expectedErrorMessage = `Value '${inputs['dotnet-quality']}' is not supported for the 'dotnet-quality' option. Supported values are: daily, preview, ga.`;
+
+      await setup.run();
+      expect(setFailedSpy).toHaveBeenCalledWith(expectedErrorMessage);
+    });
+
+    it('should call installDotnet() multiple times if dotnet-version multiline input is provided', async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = ['9.0', '10.0'];
+      inputs['dotnet-quality'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(installDotnetSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('should call addToPath() after installation complete', async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = ['9.0', '10.0'];
+      inputs['dotnet-quality'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(DotnetInstallDir.addToPath).toHaveBeenCalledTimes(1);
+    });
+
+    it('should call auth.configAuthentication() if source-url input is provided', async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['source-url'] = 'fictitious.source.url';
+
+      configAuthenticationSpy.mockImplementation(() => {});
+
+      await setup.run();
+      expect(configAuthenticationSpy).toHaveBeenCalledWith(
+        inputs['source-url'],
+        undefined
+      );
+    });
+
+    it('should call auth.configAuthentication() with proper parameters if source-url and config-file inputs are provided', async () => {
+      inputs['global-json-file'] = '';
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['source-url'] = 'fictitious.source.url';
+      inputs['config-file'] = 'fictitious.path';
+
+      configAuthenticationSpy.mockImplementation(() => {});
+      setOutputSpy.mockImplementation(() => {});
+
+      await setup.run();
+      expect(configAuthenticationSpy).toHaveBeenCalledWith(
+        inputs['source-url'],
+        inputs['config-file']
+      );
+    });
+
+    it('should call setOutput() after installation complete successfully', async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+
+      installDotnetSpy.mockImplementation(() =>
+        Promise.resolve(`${inputs['dotnet-version']}`)
+      );
+
+      await setup.run();
+      expect(DotnetInstallDir.addToPath).toHaveBeenCalledTimes(1);
+    });
+
+    it(`shouldn't call setOutput() if parsing dotnet-installer logs failed`, async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      const warningMessage = `Failed to output the installed version of .NET. The 'dotnet-version' output will not be set.`;
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(null));
+
+      await setup.run();
+      expect(warningSpy).toHaveBeenCalledWith(warningMessage);
+      expect(setOutputSpy).not.toHaveBeenCalled();
+    });
+
+    it(`shouldn't call setOutput() if actions didn't install .NET`, async () => {
+      inputs['dotnet-version'] = [];
+      const warningMessage = `The 'dotnet-version' output will not be set.`;
+
+      await setup.run();
+
+      expect(infoSpy).toHaveBeenCalledWith(warningMessage);
+      expect(setOutputSpy).not.toHaveBeenCalled();
+    });
+
+    it(`should get 'cache-dependency-path' and call restoreCache() if input cache is set to true and cache feature is available`, async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['cache'] = true;
+      inputs['cache-dependency-path'] = 'fictitious.package.lock.json';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      isCacheFeatureAvailableSpy.mockImplementation(() => true);
+      restoreCacheSpy.mockImplementation(() => Promise.resolve());
+
+      await setup.run();
+      expect(isCacheFeatureAvailableSpy).toHaveBeenCalledTimes(1);
+      expect(restoreCacheSpy).toHaveBeenCalledWith(
+        inputs['cache-dependency-path']
+      );
+    });
+
+    it(`shouldn't call restoreCache() if input cache isn't set to true`, async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['cache'] = false;
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      isCacheFeatureAvailableSpy.mockImplementation(() => true);
+      restoreCacheSpy.mockImplementation(() => Promise.resolve());
+
+      await setup.run();
+      expect(restoreCacheSpy).not.toHaveBeenCalled();
+    });
+
+    it(`shouldn't call restoreCache() if cache feature isn't available`, async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['cache'] = true;
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      isCacheFeatureAvailableSpy.mockImplementation(() => false);
+      restoreCacheSpy.mockImplementation(() => Promise.resolve());
+
+      await setup.run();
+      expect(restoreCacheSpy).not.toHaveBeenCalled();
+    });
+
+    it('should pass valid architecture input to DotnetCoreInstaller', async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = os.arch().toLowerCase();
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(DotnetInstallDir.addToPath).toHaveBeenCalledTimes(1);
+    });
+
+    it('should work with empty architecture input for auto-detection', async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(DotnetInstallDir.addToPath).toHaveBeenCalledTimes(1);
+    });
+
+    it("should read the 'check-latest' input and pass it to DotnetCoreInstaller", async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+
+      let capturedCheckLatest: boolean | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedCheckLatest = this.checkLatest;
+        return Promise.resolve('');
+      });
+
+      await setup.run();
+
+      expect(getBooleanInputSpy).toHaveBeenCalledWith('check-latest');
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(capturedCheckLatest).toBe(false);
+    });
+
+    it("should read the 'skip-lts-prepass' input and pass it to DotnetCoreInstaller", async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = '';
+      inputs['skip-lts-prepass'] = 'true';
+
+      let capturedSkipLtsPrepass: boolean | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedSkipLtsPrepass = this.skipLtsPrepass;
+        return Promise.resolve('');
+      });
+
+      await setup.run();
+
+      expect(getBooleanInputSpy).toHaveBeenCalledWith('skip-lts-prepass');
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(capturedSkipLtsPrepass).toBe(true);
+    });
+
+    it("should default 'skip-lts-prepass' to false when the input isn't set", async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = '';
+      inputs['skip-lts-prepass'] = '';
+
+      let capturedSkipLtsPrepass: boolean | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedSkipLtsPrepass = this.skipLtsPrepass;
+        return Promise.resolve('');
+      });
+
+      await setup.run();
+
+      expect(getBooleanInputSpy).toHaveBeenCalledWith('skip-lts-prepass');
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(capturedSkipLtsPrepass).toBe(false);
+    });
+
+    describe("'check-latest' resolution", () => {
+      const captureCheckLatest = async () => {
+        inputs['dotnet-version'] = ['10.0.101'];
+        inputs['dotnet-quality'] = '';
+        inputs['architecture'] = '';
+
+        let capturedCheckLatest: boolean | undefined;
+        installDotnetSpy.mockImplementation(function (this: any) {
+          capturedCheckLatest = this.checkLatest;
+          return Promise.resolve('');
+        });
+
+        await setup.run();
+        return capturedCheckLatest;
+      };
+
+      it('defaults to true when neither the input nor the environment variable is set', async () => {
+        inputs['check-latest'] = '';
+
+        expect(await captureCheckLatest()).toBe(true);
+        expect(getBooleanInputSpy).not.toHaveBeenCalledWith('check-latest');
+      });
+
+      it.each(['false', 'FALSE', 'False'])(
+        "reads 'check-latest' from the DOTNET_CHECK_LATEST environment variable ('%s')",
+        async envValue => {
+          inputs['check-latest'] = '';
+          process.env['DOTNET_CHECK_LATEST'] = envValue;
+
+          expect(await captureCheckLatest()).toBe(false);
+        }
+      );
+
+      it('lets an explicit input win over the environment variable', async () => {
+        inputs['check-latest'] = 'true';
+        process.env['DOTNET_CHECK_LATEST'] = 'false';
+
+        expect(await captureCheckLatest()).toBe(true);
+      });
+
+      it('warns and falls back to true when the environment variable is not a boolean', async () => {
+        inputs['check-latest'] = '';
+        process.env['DOTNET_CHECK_LATEST'] = 'yes';
+
+        expect(await captureCheckLatest()).toBe(true);
+        expect(warningSpy).toHaveBeenCalledWith(
+          `Value 'yes' is not supported for the DOTNET_CHECK_LATEST environment variable. Supported values are: true, false. The 'check-latest' option falls back to 'true'.`
+        );
+        expect(setFailedSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    it('should fail the action if unsupported architecture is provided', async () => {
+      inputs['dotnet-version'] = ['10.0.101'];
+      inputs['dotnet-quality'] = '';
+      inputs['architecture'] = 'x688';
+
+      const expectedErrorMessage = `Value 'x688' is not supported for the 'architecture' option. Supported values are: x64, x86, arm64, amd64, arm, s390x, ppc64le, riscv64.`;
+
+      await setup.run();
+      expect(setFailedSpy).toHaveBeenCalledWith(expectedErrorMessage);
+    });
+
+    it('should fail the action if unsupported dotnet-channel value is provided with latest', async () => {
+      inputs['dotnet-version'] = ['latest'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = 'invalid';
+      inputs['architecture'] = '';
+
+      const expectedErrorMessage = `Value 'invalid' is not supported for the 'dotnet-channel' option. Supported values are: LTS, STS, A.B (e.g. 8.0), A.B.Cxx (e.g. 8.0.1xx).`;
+
+      await setup.run();
+      expect(setFailedSpy).toHaveBeenCalledWith(expectedErrorMessage);
+    });
+
+    it('should warn but not fail if unsupported dotnet-channel value is provided with a specific version', async () => {
+      inputs['dotnet-version'] = ['8.0.x'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = 'invalid';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(setFailedSpy).not.toHaveBeenCalled();
+      expect(warningSpy).toHaveBeenCalledWith(
+        `Value 'invalid' is not supported for the 'dotnet-channel' option and will be ignored because 'dotnet-version' is not set to 'latest'. Supported values are: LTS, STS, A.B (e.g. 8.0), A.B.Cxx (e.g. 8.0.1xx).`
+      );
+    });
+
+    it('should pass valid dotnet-channel value through without error', async () => {
+      inputs['dotnet-version'] = ['latest'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = 'LTS';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(setFailedSpy).not.toHaveBeenCalled();
+    });
+
+    it('should pass A.B channel value through without error when used with latest', async () => {
+      inputs['dotnet-version'] = ['latest'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '8.0';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(setFailedSpy).not.toHaveBeenCalled();
+    });
+
+    it('should pass A.B.Cxx channel value through without error when used with latest', async () => {
+      inputs['dotnet-version'] = ['latest'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '8.0.1xx';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(setFailedSpy).not.toHaveBeenCalled();
+    });
+
+    it('should fail with A.B.Cxx channel if major version is below 5', async () => {
+      inputs['dotnet-version'] = ['latest'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '3.1.1xx';
+      inputs['architecture'] = '';
+
+      const expectedErrorMessage = `Value '3.1.1xx' is not supported for the 'dotnet-channel' option. Supported values are: LTS, STS, A.B (e.g. 8.0), A.B.Cxx (e.g. 8.0.1xx).`;
+
+      await setup.run();
+      expect(setFailedSpy).toHaveBeenCalledWith(expectedErrorMessage);
+    });
+
+    it('should warn and not fail if valid dotnet-channel is provided with a non-latest version', async () => {
+      inputs['dotnet-version'] = ['8.0.x'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = 'LTS';
+      inputs['architecture'] = '';
+
+      installDotnetSpy.mockImplementation(() => Promise.resolve(''));
+
+      await setup.run();
+      expect(setFailedSpy).not.toHaveBeenCalled();
+      expect(warningSpy).toHaveBeenCalledWith(
+        `The 'dotnet-channel' input is only supported when 'dotnet-version' is set to 'latest'.`
+      );
+    });
+
+    it('should pass the global.json rollForward minimum version to DotnetCoreInstaller', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({
+          sdk: {version: '8.0.400', rollForward: 'latestFeature'}
+        })
+      );
+
+      let capturedVersion: string | undefined;
+      let capturedMinimumVersion: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedVersion = this.version;
+        capturedMinimumVersion = this.minimumVersion;
+        return Promise.resolve('8.0.412');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedVersion).toBe('8.0');
+      expect(capturedMinimumVersion).toBe('8.0.400');
+    });
+
+    it('should pass non-latest rollForward policies to DotnetCoreInstaller', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.100', rollForward: 'feature'}})
+      );
+
+      let capturedVersion: string | undefined;
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedVersion = this.version;
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.200');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedVersion).toBe('8.0.100');
+      expect(capturedMinimumVersion).toBe('8.0.100');
+      expect(capturedRollForward).toBe('feature');
+    });
+
+    it('should default an omitted rollForward to patch', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.100'}})
+      );
+
+      let capturedVersion: string | undefined;
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedVersion = this.version;
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.100');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedVersion).toBe('8.0.100');
+      expect(capturedMinimumVersion).toBe('8.0.100');
+      expect(capturedRollForward).toBe('patch');
+    });
+
+    it('should not default to patch for a prerelease sdk version', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.100-preview.1'}})
+      );
+
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.100-preview.1');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedMinimumVersion).toBeUndefined();
+      expect(capturedRollForward).toBeUndefined();
+    });
+
+    it('should not default to patch for a version that is not a full SDK version', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.0'}})
+      );
+
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.0');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedMinimumVersion).toBeUndefined();
+      expect(capturedRollForward).toBeUndefined();
+    });
+
+    it('should not roll forward a version pinned by the dotnet-version input', async () => {
+      inputs['dotnet-version'] = ['8.0.100'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.100'}})
+      );
+
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.100');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(capturedMinimumVersion).toBeUndefined();
+      expect(capturedRollForward).toBeUndefined();
+    });
+
+    it('should keep the global.json floor when a floating dotnet-version matches', async () => {
+      inputs['dotnet-version'] = ['8.0'];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({
+          sdk: {version: '8.0.400', rollForward: 'latestFeature'}
+        })
+      );
+
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.400');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(installDotnetSpy).toHaveBeenCalledTimes(1);
+      expect(capturedMinimumVersion).toBe('8.0.400');
+      expect(capturedRollForward).toBe('latestFeature');
+    });
+
+    it('should not set a rollForward policy for disable', async () => {
+      inputs['dotnet-version'] = [];
+      inputs['dotnet-quality'] = '';
+      inputs['dotnet-channel'] = '';
+      inputs['architecture'] = '';
+      inputs['check-latest'] = 'false';
+      inputs['global-json-file'] = 'global.json';
+
+      existsSyncSpy.mockReturnValue(true);
+      readFileSyncSpy.mockReturnValue(
+        JSON.stringify({sdk: {version: '8.0.100', rollForward: 'disable'}})
+      );
+
+      let capturedMinimumVersion: string | undefined;
+      let capturedRollForward: string | undefined;
+      installDotnetSpy.mockImplementation(function (this: any) {
+        capturedMinimumVersion = this.minimumVersion;
+        capturedRollForward = this.rollForward;
+        return Promise.resolve('8.0.100');
+      });
+
+      await setup.run();
+      inputs['global-json-file'] = '';
+
+      expect(capturedMinimumVersion).toBeUndefined();
+      expect(capturedRollForward).toBeUndefined();
+    });
   });
-
-  afterAll(async () => {
-    try {
-      await io.rmRF(path.join(process.cwd(), 'global.json'));
-      await io.rmRF(toolDir);
-      await io.rmRF(tempDir);
-    } catch {
-      console.log('Failed to remove test directories');
-    }
-  }, 30000);
-
-  it('Acquires version of dotnet from global.json if no matching version is installed', async () => {
-    const globalJsonPath = path.join(process.cwd(), 'global.json');
-    const jsonContents = `{${os.EOL}"sdk": {${os.EOL}"version": "3.1.201"${os.EOL}}${os.EOL}}`;
-    if (!fs.existsSync(globalJsonPath)) {
-      fs.writeFileSync(globalJsonPath, jsonContents);
-    }
-    await setup.run();
-
-    expect(fs.existsSync(path.join(toolDir, 'sdk', '3.1.201'))).toBe(true);
-    if (IS_WINDOWS) {
-      expect(fs.existsSync(path.join(toolDir, 'dotnet.exe'))).toBe(true);
-    } else {
-      expect(fs.existsSync(path.join(toolDir, 'dotnet'))).toBe(true);
-    }
-  }, 400000);
 });

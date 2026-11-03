@@ -3,12 +3,18 @@ sources:
 
 allowed:
   - apache-2.0
+  - 0bsd
   - bsd-2-clause
   - bsd-3-clause
   - isc
   - mit
   - cc0-1.0
   - unlicense
+  - BlueOak-1.0.0
 
 reviewed:
   npm:
+    - sax # ISC + MIT
+    - "@actions/http-client" # MIT
+    - balanced-match # MIT
+    - brace-expansion # MIT
